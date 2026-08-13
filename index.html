@@ -1,0 +1,831 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>ROBO RUSH</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  html,body{height:100%;margin:0;background:#081020;color:#fff;font-family:monospace;overflow:hidden}
+  #wrap{position:absolute;inset:0;display:flex;align-items:center;justify-content:center}
+  canvas{image-rendering:pixelated;border:12px solid #041018;box-shadow:0 8px 30px rgba(0,0,0,.7)}
+  .ui{position:fixed;left:12px;top:12px;color:#9be;pointer-events:none}
+  a{color:#9be}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="screen" width=384 height=216></canvas></div>
+<script>
+// ----------------------------- Globals & Utilities -----------------------------
+const CANVAS_W=384, CANVAS_H=216;
+const canvas=document.getElementById('screen'), ctx=canvas.getContext('2d');
+let scale=1;
+function fitCanvas(){ // scale to window while preserving aspect ratio
+  const iw=innerWidth, ih=innerHeight;
+  const s=Math.min((iw-40)/CANVAS_W,(ih-40)/CANVAS_H);
+  scale=Math.max(1,Math.floor(s));
+  canvas.style.width=(CANVAS_W*scale)+'px'; canvas.style.height=(CANVAS_H*scale)+'px';
+}
+addEventListener('resize',fitCanvas); fitCanvas();
+let now=performance.now(), lastTime=now;
+
+// Simple RNG
+const rand=(a=1,b=0)=>a+(b-a)*Math.random();
+
+// ----------------------------- Input & Gamepad -----------------------------
+const Key = {};
+const KEYS = {
+  left:['ArrowLeft','a','A'], right:['ArrowRight','d','D'],
+  jump:['ArrowUp','w','W',' '], shoot:['j','J','z','Z'], dash:['k','K','x','X'],
+  pause:['Escape'], enter:['Enter'], restart:['r','R'], one:['1'],two:['2'],three:['3'],four:['4'],five:['5']
+};
+const held={};
+window.addEventListener('keydown',e=>{
+  for(const g in KEYS) if(KEYS[g].includes(e.key)) { Key[g]=true; held[e.key]=true; e.preventDefault();}
+  if(e.key===' '||e.key==='ArrowUp'||e.key==='ArrowDown'||e.key==='ArrowLeft'||e.key==='ArrowRight') e.preventDefault();
+});
+window.addEventListener('keyup',e=>{
+  for(const g in KEYS) if(KEYS[g].includes(e.key)) Key[g]=false;
+  held[e.key]=false;
+});
+let gpState={};
+function pollGamepad(){
+  const pads=navigator.getGamepads?navigator.getGamepads():[];
+  if(pads[0]) {
+    const p=pads[0];
+    Key.left = p.axes[0]<-0.4 || p.buttons[14]?.pressed;
+    Key.right = p.axes[0]>0.4 || p.buttons[15]?.pressed;
+    Key.jump = p.buttons[0]?.pressed;
+    Key.shoot = p.buttons[2]?.pressed;
+    Key.dash = p.buttons[1]?.pressed;
+    Key.pause = p.buttons[9]?.pressed;
+  }
+}
+
+// ----------------------------- Audio (Retro SFX & Music) -----------------------------
+const AudioSys = (() => {
+  const ctxAudio = new (window.AudioContext||window.webkitAudioContext)();
+  const master = ctxAudio.createGain(); master.connect(ctxAudio.destination); master.gain.value=0.65;
+  let mute=false;
+  function osc(freq,type='sine',dur=0.2,vol=0.6,when=0,pan=0){
+    const o=ctxAudio.createOscillator(), g=ctxAudio.createGain(), p=ctxAudio.createStereoPanner();
+    o.type=type; o.frequency.value=freq; g.gain.value=vol; p.pan.value=pan;
+    o.connect(g); g.connect(p); p.connect(master);
+    o.start(ctxAudio.currentTime+when); g.gain.exponentialRampToValueAtTime(0.0001,ctxAudio.currentTime+when+dur);
+    o.stop(ctxAudio.currentTime+when+dur+0.02);
+  }
+  function noise(vol=0.5,dur=0.2,when=0){
+    const buffer=ctxAudio.createBuffer(1,dur*ctxAudio.sampleRate,ctxAudio.sampleRate);
+    const data=buffer.getChannelData(0);
+    for(let i=0;i<data.length;i++) data[i]=(Math.random()*2-1)*Math.pow(1-i/data.length,2);
+    const src=ctxAudio.createBufferSource(), g=ctxAudio.createGain();
+    src.buffer=buffer; g.gain.value=vol; src.connect(g); g.connect(master);
+    src.start(ctxAudio.currentTime+when); src.stop(ctxAudio.currentTime+when+dur+0.02);
+  }
+  function sfx(type='blip'){ // simple mapping
+    if(mute) return;
+    switch(type){
+      case 'jump': osc(440,'sine',0.18,0.5,0,0); osc(660,'square',0.08,0.25,0,0.2); break;
+      case 'shoot': osc(900,'sawtooth',0.06,0.35,0,0); break;
+      case 'charge': osc(200,'sine',0.25,0.25,0,0); break;
+      case 'dash': noise(0.18,0.07); osc(620,'sawtooth',0.06,0.3,0,0.1); break;
+      case 'hit': noise(0.3,0.12); osc(220,'sine',0.06,0.25,0,-0.2); break;
+      case 'explode': noise(0.6,0.4); osc(120,'sawtooth',0.4,0.5); break;
+      case 'pickup': osc(1200,'triangle',0.12,0.45); break;
+      case 'menu': osc(880,'sine',0.08,0.25); break;
+      case 'boss': osc(120,'sine',0.4,0.6); break;
+      default: osc(600,'sine',0.06,0.3); break;
+    }
+  }
+  function toggleMute(){ mute=!mute; master.gain.value = mute ? 0 : 0.65; save(); }
+  // simple looping background music (very minimal)
+  let musicOn=false, musicNodes=[];
+  function startMusic(){
+    if(mute||musicOn) return; musicOn=true;
+    const t=ctxAudio.currentTime;
+    // make a simple loop using oscillators
+    for(let i=0;i<3;i++){
+      const o=ctxAudio.createOscillator(), g=ctxAudio.createGain();
+      o.type = i===0 ? 'square' : i===1 ? 'sawtooth' : 'triangle';
+      o.frequency.value = [110,220,330][i];
+      g.gain.value = 0.04;
+      o.connect(g); g.connect(master); o.start(t); musicNodes.push(o);
+    }
+  }
+  function stopMusic(){
+    musicNodes.forEach(n=>n.stop()); musicNodes=[]; musicOn=false;
+  }
+  function save(){ localStorage.setItem('roborush_audio_mute', JSON.stringify(mute)); }
+  // load saved mute
+  try{ const m=JSON.parse(localStorage.getItem('roborush_audio_mute')); if(m) toggleMute(); } catch(e){}
+  return {sfx,osc,noise,toggleMute,startMusic,stopMusic,ctx:ctxAudio};
+})();
+
+// ----------------------------- Game State, Save System -----------------------------
+const SaveSys = {
+  key:'roborush_save_v1',
+  data:{unlockedWeapons:{1:true},gear:0,upgrades:{},bestScores:{},stagesDone:[],lives:3,maxHP:100},
+  load(){ try{ const s=JSON.parse(localStorage.getItem(this.key)); if(s) Object.assign(this.data,s); }catch(e){} },
+  save(){ localStorage.setItem(this.key,JSON.stringify(this.data)); },
+  reset(){ if(confirm('Reset all Robo Rush save data?')){ localStorage.removeItem(this.key); this.data={unlockedWeapons:{1:true},gear:0,upgrades:{},bestScores:{},stagesDone:[],lives:3,maxHP:100}; location.reload(); } }
+}; SaveSys.load();
+
+// ----------------------------- Utility: Rectangle Collision -----------------------------
+function rectOverlap(a,b){
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+// ----------------------------- Particles -----------------------------
+const particles=[];
+function spawnParticle(x,y,opts={}){
+  const p={x,y,vx:rand(opts.vx||-1,opts.vx2||1),vy:rand(opts.vy||-2,opts.vy2||0),life:rand(30,80),c:opts.c||'#fff',size:rand(1,3),fade:0};
+  particles.push(p);
+}
+function updateParticles(dt){
+  for(let i=particles.length-1;i>=0;i--){
+    const p=particles[i];
+    p.vy+=0.12*dt; p.x+=p.vx*dt; p.y+=p.vy*dt; p.fade++; if(p.fade>p.life) particles.splice(i,1);
+  }
+}
+function drawParticles(sx=0,sy=0){
+  for(const p of particles){
+    ctx.fillStyle=p.c; ctx.globalAlpha=1-Math.min(1,p.fade/p.life); ctx.fillRect(Math.round(p.x)-sx,Math.round(p.y)-sy,p.size,p.size);
+  }
+  ctx.globalAlpha=1;
+}
+
+// ----------------------------- Camera -----------------------------
+const Camera = {
+  x:0,y:0,shake:0,
+  follow(target,dt,level){
+    const look = target.vx>0?40:target.vx<0?-40:0;
+    const tx = Math.max(0, Math.min(level.width-CANVAS_W, target.x + target.w/2 - CANVAS_W/2 + look));
+    const ty = Math.max(0, Math.min(level.height-CANVAS_H, target.y + target.h/2 - CANVAS_H/2));
+    this.x += (tx - this.x) * Math.min(1, 5*dt);
+    this.y += (ty - this.y) * Math.min(1, 5*dt);
+    if(this.shake>0) this.shake -= dt*60;
+  },
+  apply(){ if(this.shake>0){ ctx.translate(Math.random()*this.shake- this.shake/2, Math.random()*this.shake - this.shake/2); } }
+};
+
+// ----------------------------- Core Entities -----------------------------
+const projectiles=[];
+const enemies=[];
+const platforms=[]; // collision boxes
+const hazards=[];
+const checkpoints=[];
+let level = null;
+
+// ----------------------------- Stage Definitions (5 stages) -----------------------------
+const STAGES = [
+  {id:0,name:"Neon City",bg:['#071026','#0b1b34','#13294d'],width:2400,height:400,difficulty:1,boss:'Volt Titan'},
+  {id:1,name:"Jungle Factory",bg:['#041a0d','#08331b','#0a4527'],width:2600,height:600,difficulty:2,boss:'Thorn Crusher'},
+  {id:2,name:"Ice Core",bg:['#07101a','#0c1a26','#123343'],width:2200,height:800,difficulty:2,boss:'Frost Machine'},
+  {id:3,name:"Volcanic Forge",bg:['#2b0a06','#3a1208','#4a1708'],width:2800,height:700,difficulty:3,boss:'Inferno Gear'},
+  {id:4,name:"Omega Citadel",bg:['#050405','#0a0a0a','#101014'],width:3200,height:1000,difficulty:4,boss:'Omega Core'}
+];
+
+// ----------------------------- Player (Bolt) -----------------------------
+const Player = {
+  x:60,y:100,w:14,h:20,vx:0,vy:0,speed:0,dir:1, onGround:false,canDouble:false,
+  hp:100,maxHp:100,lives:3,invuln:0,dashTimer:0, dashCD:0, shootingCooldown:0, chargeTime:0, score:0,
+  weapon:1, weaponEnergy:{1:999,2:100,3:100,4:100,5:100},
+  anim:0, state:'idle', respawnPoint:{x:60,y:100},dead:false,
+  reset(x,y){ this.x=x; this.y=y; this.vx=0; this.vy=0; this.hp=this.maxHp; this.invuln=0; this.dead=false; this.dashTimer=0; this.dashCD=0; this.shootingCooldown=0; this.chargeTime=0; },
+  damage(dmg, nx){
+    if(this.invuln>0||this.dead) return;
+    this.hp -= dmg; this.invuln = 60; AudioSys.sfx('hit'); Camera.shake=6;
+    for(let i=0;i<12;i++) spawnParticle(this.x+this.w/2,this.y+this.h/2,{c:'#ff2244',vx:-2+Math.random()*4,vy:-3+Math.random()*3});
+    this.vx = nx; this.vy = -3;
+    if(this.hp<=0){ this.die(); }
+  },
+  die(){
+    this.dead=true; AudioSys.sfx('explode'); Camera.shake=16;
+    // explosion particles
+    for(let i=0;i<60;i++) spawnParticle(this.x+this.w/2,this.y+this.h/2,{c:'#ff5500',vx:-6+Math.random()*12,vy:-6+Math.random()*12});
+    setTimeout(()=> {
+      this.lives--; if(this.lives<0) { Game.over=true; } else { Game.respawn(); }
+    },800);
+  },
+  shoot(nox, noy, weapon, power){
+    // create projectile
+    const dir=this.dir;
+    let p={x:this.x+this.w/2 + (dir>0?8:-8), y:this.y+8, vx: (10+power*4)*dir, vy:0, w:6, h:6, life:120, owner:'player', dmg:4+power*4, col:'#9cf'};
+    // weapon variants
+    switch(weapon){
+      case 1: p.col='#9cf'; p.dmg=6+power*2; p.vx*=1; break;
+      case 2: // Volt Blade (melee wave)
+        p.w=10; p.h=10; p.col='#7fffd4'; p.dmg=10+power*6; p.vx*=0.8; p.vy=0; break;
+      case 3: // Thorn Cannon (spreads)
+        if(power>=2) { p.dmg+=6; } p.col='#7fbf3f'; break;
+      case 4: // Ice Burst
+        p.col='#cfefff'; p.dmg=8+power*4; p.vx*=0.9; break;
+      case 5: // Fire Blast
+        p.col='#ff9744'; p.dmg=10+power*6; p.vx*=1.1; break;
+    }
+    projectiles.push(p); AudioSys.sfx('shoot');
+  }
+};
+
+// ----------------------------- Entities: Enemy Factory -----------------------------
+function spawnEnemy(type,x,y){
+  const e = {id:Date.now()+Math.random(),type,x,y,w:16,h:16,vx:0,vy:0,ax:0,ay:0,health:10,maxHealth:10,dir:1,aiTimer:0,alive:true};
+  switch(type){
+    case 'walker': e.health=8; e.ai='walk'; e.vx=1.0; break;
+    case 'fly': e.health=6; e.ai='fly'; e.vx=0; break;
+    case 'turret': e.health=12; e.ai='turret'; e.vx=0; break;
+    case 'charger': e.health=14; e.ai='charge'; e.vx=0; break;
+    case 'exploder': e.health=4; e.ai='explode'; break;
+    case 'sniper': e.health=8; e.ai='sniper'; break;
+  }
+  enemies.push(e);
+  return e;
+}
+function enemyHit(e,dmg){
+  e.health -= dmg; AudioSys.sfx('hit'); Camera.shake=2;
+  for(let i=0;i<6;i++) spawnParticle(e.x+e.w/2,e.y+e.h/2,{c:'#ff6666',vx:rand(-2,2),vy:rand(-2,2)});
+  if(e.health<=0) enemyDie(e);
+}
+function enemyDie(e){
+  e.alive=false; AudioSys.sfx('explode'); Camera.shake=6; Player.score += 100;
+  for(let i=0;i<20;i++) spawnParticle(e.x+e.w/2,e.y+e.h/2,{c:'#ffcc66',vx:rand(-3,3),vy:rand(-4,2)});
+}
+
+// ----------------------------- Boss Template -----------------------------
+function createBoss(name,x,y,behave){
+  return {name,x,y,w:80,h:80,vx:0,vy:0,health:200,maxHealth:200,phase:1,ai:behave,alive:true,inv:0};
+}
+
+// ----------------------------- Level Builder -----------------------------
+function buildLevel(stageId){
+  // reset arrays
+  projectiles.length=0; enemies.length=0; platforms.length=0; hazards.length=0; checkpoints.length=0; particles.length=0;
+  const s = STAGES[stageId];
+  level = {stageId:stageId, name:s.name, width:s.width, height:s.height, bg:s.bg, bosses:[],start:{x:60,y:100},scoreGoal:0};
+  // ground
+  for(let i=0;i<s.width;i+=64) platforms.push({x:i,y:s.height-40,w:64,h:40});
+  // some platforms and hazards depending on stage
+  if(stageId===0){ // Neon City: moving platforms, pits, basic enemies
+    for(let i=200;i<level.width-300;i+=240) {
+      platforms.push({x:i,y:s.height-120,w:96,h:12});
+      spawnEnemy('walker',i+20,s.height-140);
+      if(i%480===200) spawnEnemy('turret',i+80,s.height-160);
+    }
+    // hazards
+    for(let i=600;i<level.width-400;i+=500) hazards.push({x:i,y:s.height-40,w:80,h:40,type:'pit'});
+  }
+  if(stageId===1){ // Jungle Factory
+    for(let i=200;i<level.width-600;i+=200){
+      platforms.push({x:i,y:s.height-160-(i%400),w:120,h:12});
+      spawnEnemy('fly',i+20,s.height-200);
+      if(i%400===200) spawnEnemy('charger',i+60,s.height-180);
+    }
+    for(let i=500;i<level.width-300;i+=700) hazards.push({x:i,y:s.height-40,w:140,h:40,type:'acid'});
+  }
+  if(stageId===2){ // Ice Core
+    for(let i=150;i<level.width-300;i+=180) {
+      platforms.push({x:i,y:s.height-140-(i%220),w:80,h:12,ice:true});
+      spawnEnemy('walker',i+10,s.height-160);
+      if(i%360===150) spawnEnemy('sniper',i+40,s.height-200);
+    }
+    for(let i=400;i<level.width-500;i+=600) hazards.push({x:i,y:50,w:60,h:60,type:'icicle',vy:0,fall:true});
+  }
+  if(stageId===3){ // Volcanic Forge
+    for(let i=200;i<level.width-400;i+=160) {
+      platforms.push({x:i,y:s.height-160 + ((i/160)%3)*30,w:100,h:12});
+      spawnEnemy('exploder',i+20,s.height-200);
+      if(i%480===200) spawnEnemy('turret',i+60,s.height-180);
+    }
+    for(let i=700;i<level.width-400;i+=700) hazards.push({x:i,y:s.height-40,w:200,h:40,type:'lava'});
+  }
+  if(stageId===4){ // Omega Citadel
+    for(let i=160;i<level.width-800;i+=140) {
+      platforms.push({x:i,y:100+ (i%320),w:80,h:12});
+      spawnEnemy('sniper',i+10,90+(i%320));
+      if(i%420===160) spawnEnemy('charger',i+40,60+(i%320));
+    }
+    for(let i=900;i<level.width-400;i+=600) hazards.push({x:i,y:150,w:30,h:300,type:'laser'});
+  }
+  // checkpoints spaced
+  for(let i=500;i<level.width;i+=700) checkpoints.push({x:i,y:s.height-120,active:false});
+  // boss area at near the end
+  const bossX = level.width - 500;
+  let boss;
+  switch(stageId){
+    case 0: boss=createBoss('Volt Titan',bossX,level.height-200,voltTitanAI); boss.maxHealth=150; break;
+    case 1: boss=createBoss('Thorn Crusher',bossX,level.height-220,thornCrusherAI); boss.maxHealth=220; break;
+    case 2: boss=createBoss('Frost Machine',bossX,level.height-260,frostMachineAI); boss.maxHealth=200; break;
+    case 3: boss=createBoss('Inferno Gear',bossX,level.height-260,infernoGearAI); boss.maxHealth=260; break;
+    case 4: boss=createBoss('Omega Core',bossX-100,level.height-300,omegaCoreAI); boss.maxHealth=600; break;
+  }
+  boss.x = boss.x; level.boss = boss; level.width+=200; // extend room
+  return level;
+}
+
+// ----------------------------- Boss AIs (simplified but distinct) -----------------------------
+function voltTitanAI(b,dt){
+  b.aiTimer = (b.aiTimer||0) + dt*60;
+  if(b.aiTimer<80){ // charge bolts
+    if(Math.floor(b.aiTimer)%30===0) { // shoot bolts
+      projectiles.push({x:b.x+40,y:b.y+30,vx:-5,vy:rand(-1,1),w:8,h:8,life:200,owner:'boss',dmg:10,col:'#7ff'});
+      AudioSys.sfx('boss');
+    }
+  } else if(b.aiTimer<160){
+    if(Math.floor(b.aiTimer)%40===0) projectiles.push({x:b.x+40,y:b.y+30,vx:-8,vy:0,w:10,h:10,life:160,owner:'boss',dmg:14,col:'#5ff'});
+  } else { b.aiTimer=0; }
+  // move slightly
+  b.vy = Math.sin(performance.now()/500)*0.5;
+  b.y += b.vy;
+}
+function thornCrusherAI(b,dt){
+  b.aiTimer=(b.aiTimer||0)+dt*60;
+  if(Math.floor(b.aiTimer)%60===0){
+    // spawn spinning saws as projectiles
+    projectiles.push({x:b.x-10,y:b.y+40,vx:-6,vy:rand(-1,1),w:12,h:12,life:160,owner:'boss',dmg:12,col:'#7fbf3f'});
+    AudioSys.sfx('boss');
+  }
+  if(b.aiTimer>120){ // vine ground spikes (hazard projectiles)
+    const hx={x:b.x-200,y:b.y+90,w:8,h:40,type:'spike'}; hazards.push(hx);
+    setTimeout(()=>{ hazards.splice(hazards.indexOf(hx),1); },2000);
+    b.aiTimer=0;
+  }
+}
+function frostMachineAI(b,dt){
+  b.aiTimer=(b.aiTimer||0)+dt*60;
+  if(Math.floor(b.aiTimer)%50===0){
+    projectiles.push({x:b.x-10,y:b.y+30,vx:-4,vy:-2,w:10,h:10,life:200,owner:'boss',dmg:10,col:'#cfefff'});
+    AudioSys.sfx('boss');
+  }
+  if(b.aiTimer%120>100){
+    // drop icicle hazards
+    hazards.push({x:b.x-150+Math.random()*300,y:0,w:8,h:20,type:'icicle',fall:true});
+  }
+}
+function infernoGearAI(b,dt){
+  b.aiTimer=(b.aiTimer||0)+dt*60;
+  if(Math.floor(b.aiTimer)%30===0){
+    projectiles.push({x:b.x-10,y:b.y+30,vx:-6,vy:rand(-2,2),w:10,h:10,life:160,owner:'boss',dmg:14,col:'#ff6'});
+    AudioSys.sfx('boss');
+  }
+  if(b.aiTimer%200>180){
+    // lava eruption: hazards
+    hazards.push({x:b.x-250+Math.random()*500,y:b.y+80,w:60,h:40,type:'lava'});
+  }
+}
+function omegaCoreAI(b,dt){
+  b.aiTimer=(b.aiTimer||0)+dt*60;
+  // three phases determined by health
+  if(b.health > b.maxHealth*0.66) b.phase=1;
+  else if(b.health > b.maxHealth*0.33) b.phase=2;
+  else b.phase=3;
+  if(b.phase===1){
+    if(Math.floor(b.aiTimer)%20===0) projectiles.push({x:b.x-10,y:b.y+20,vx:-6,vy:rand(-1,1),w:8,h:8,life:160,owner:'boss',dmg:10,col:'#9cf'});
+  } else if(b.phase===2){
+    if(Math.floor(b.aiTimer)%12===0) projectiles.push({x:b.x-10,y:b.y+20,vx:-8,vy:rand(-2,2),w:10,h:10,life:160,owner:'boss',dmg:14,col:'#fbb'});
+  } else {
+    if(Math.floor(b.aiTimer)%8===0){ // intense barrages
+      for(let i=0;i<3;i++) projectiles.push({x:b.x-10,y:b.y+20+i*8,vx:-10,vy:rand(-3,3),w:10,h:10,life:160,owner:'boss',dmg:18,col:'#fff'});
+      AudioSys.sfx('explode'); Camera.shake=3;
+    }
+  }
+  // slight hover
+  b.y = b.y + Math.sin(performance.now()/700)*0.2;
+}
+
+// ----------------------------- Collision & Physics Helpers -----------------------------
+function moveEntity(e,dt){
+  // gravity
+  e.vy += 0.25*dt;
+  // limit
+  e.vy = Math.min(e.vy, 8);
+  e.x += e.vx*dt;
+  // horizontal collision vs platforms (simple)
+  for(const p of platforms){
+    if(e.x < p.x + p.w && e.x + e.w > p.x && e.y < p.y + p.h && e.y + e.h > p.y){
+      // basic resolve
+      if(e.vx>0) e.x = p.x - e.w;
+      else if(e.vx<0) e.x = p.x + p.w;
+      e.vx = 0;
+    }
+  }
+  e.y += e.vy*dt;
+  e.onGround=false;
+  for(const p of platforms){
+    if(e.x < p.x + p.w && e.x + e.w > p.x && e.y < p.y + p.h && e.y + e.h > p.y){
+      // vertical resolve
+      if(e.vy>0){ e.y = p.y - e.h; e.vy = 0; e.onGround=true; }
+      else if(e.vy<0) { e.y = p.y + p.h; e.vy = 0; }
+    }
+  }
+}
+
+// ----------------------------- Projectiles Update -----------------------------
+function updateProjectiles(dt){
+  for(let i=projectiles.length-1;i>=0;i--){
+    const p=projectiles[i];
+    p.x += p.vx*dt; p.y += p.vy*dt; p.life--;
+    if(p.life<=0 || p.x< -50 || p.x> level.width + 50) { projectiles.splice(i,1); continue; }
+    if(p.owner==='player'){
+      // check enemies
+      for(const e of enemies) if(e.alive && rectOverlap(p,{x:e.x,y:e.y,w:e.w,h:e.h})){
+        enemyHit(e,p.dmg); projectiles.splice(i,1); break;
+      }
+      // hit boss
+      if(level.boss && level.boss.alive && rectOverlap(p,{x:level.boss.x,y:level.boss.y,w:level.boss.w,h:level.boss.h})){
+        level.boss.health -= p.dmg; projectiles.splice(i,1); AudioSys.sfx('hit'); Player.score+=10;
+        if(level.boss.health<=0){ level.boss.alive=false; AudioSys.sfx('explode'); Player.score+=2000; SaveSys.data.stagesDone.push(level.stageId); SaveSys.save(); }
+      }
+    } else { // boss projectile hits player
+      if(!Player.dead && rectOverlap(p,{x:Player.x,y:Player.y,w:Player.w,h:Player.h})){
+        Player.damage(p.dmg, p.vx>0? -4:4); projectiles.splice(i,1);
+      }
+    }
+  }
+}
+
+// ----------------------------- Enemy AI Update -----------------------------
+function updateEnemies(dt){
+  for(const e of enemies){
+    if(!e.alive) continue;
+    e.aiTimer=(e.aiTimer||0)+dt*60;
+    switch(e.ai){
+      case 'walk':
+        // simple patrol
+        if(!e.aiDir) e.aiDir = Math.random()<0.5?-1:1;
+        e.vx = e.aiDir * (1 + Math.sin(performance.now()/600)*0.2);
+        // flip if platform edge
+        let onAny=false;
+        for(const p of platforms) if(e.x+e.w>p.x && e.x<p.x+p.w && e.y+e.h===p.y) onAny=true;
+        if(!onAny) e.aiDir *= -1;
+        break;
+      case 'fly':
+        e.vx = Math.sin(e.aiTimer/20)*1.5;
+        e.vy = Math.sin(performance.now()/300)*0.5;
+        break;
+      case 'turret':
+        if(Math.floor(e.aiTimer)%80===0){
+          projectiles.push({x:e.x,y:e.y+6,vx: -4,vy:0,w:8,h:8,life:140,owner:'enemy',dmg:6,col:'#f55'});
+        }
+        break;
+      case 'charge':
+        if(e.aiTimer%100<40) e.vx = -4; else e.vx=0;
+        break;
+      case 'explode':
+        if(distance(e.x, e.y, Player.x, Player.y) < 60){ enemyDie(e); for(let i=0;i<12;i++) spawnParticle(e.x,e.y,{c:'#ff2200'}); Player.damage(12,-6); }
+        break;
+      case 'sniper':
+        if(Math.floor(e.aiTimer)%120===0){
+          const sx = e.x, sy = e.y;
+          const dx = (Player.x - sx), dy = (Player.y - sy);
+          const speed = 5;
+          const ang = Math.atan2(dy, dx);
+          projectiles.push({x:sx,y:sy,vx:Math.cos(ang)*speed,vy:Math.sin(ang)*speed,w:6,h:6,life:160,owner:'enemy',dmg:8,col:'#ff66ff'});
+        }
+        break;
+    }
+    moveEntity(e,dt);
+    // collide with player
+    if(rectOverlap(e,Player) && !Player.dead && Player.invuln<=0){
+      Player.damage(8, e.x < Player.x ? 4 : -4);
+    }
+  }
+  // remove dead enemies
+  for(let i=enemies.length-1;i>=0;i--) if(!enemies[i].alive) enemies.splice(i,1);
+}
+
+// ----------------------------- Hazards Update -----------------------------
+function updateHazards(dt){
+  for(let i=hazards.length-1;i>=0;i--){
+    const h=hazards[i];
+    if(h.fall){ h.vy = (h.vy||0) + 0.25*dt; h.y += h.vy*dt; if(h.y > level.height) hazards.splice(i,1); }
+    if(rectOverlap(h,Player) && !Player.dead && Player.invuln<=0){
+      if(h.type==='lava' || h.type==='acid') Player.damage(20, -6);
+      else if(h.type==='spike') Player.damage(14, -6);
+      else if(h.type==='pit') Player.x=Player.respawnPoint.x, Player.y=Player.respawnPoint.y, Player.damage(30,0);
+      else if(h.type==='icicle'){ Player.damage(16, -6); hazards.splice(i,1); }
+    }
+  }
+}
+
+// ----------------------------- Distance Utility -----------------------------
+function distance(x1,y1,x2,y2){ return Math.hypot(x2-x1,y2-y1); }
+
+// ----------------------------- Player Update (movement, shooting, dash, charge) -----------------------------
+function updatePlayer(dt){
+  if(Player.dead) return;
+  // input
+  pollGamepad();
+  const left=Key.left, right=Key.right, jump=Key.jump, shoot=Key.shoot, dash=Key.dash;
+  // horizontal acceleration
+  const acc = 0.35;
+  if(left) { Player.vx = Math.max(Player.vx - acc*dt*60, -3.5); Player.dir=-1; }
+  else if(right) { Player.vx = Math.min(Player.vx + acc*dt*60, 3.5); Player.dir=1;}
+  else { Player.vx *= (0.85 + 0.15*dt); if(Math.abs(Player.vx)<0.05) Player.vx=0; }
+  // gravity and move
+  moveEntity(Player,dt);
+  // jumping
+  if(jump && Player.onGround && Player.canDouble!==false && Player.canDouble!==true) {
+    Player.vy = -5.2; Player.onGround=false; Player.canDouble=true; AudioSys.sfx('jump');
+  } else if(jump && Player.canDouble===true && !Player.onGround) {
+    // allow double jump if unlocked by upgrade
+    if(SaveSys.data.upgrades.doubleJump) { Player.vy = -4.5; Player.canDouble=false; AudioSys.sfx('jump'); }
+  }
+  // onGround landing effects
+  if(Player.onGround) {
+    Player.canDouble=false;
+  }
+  // shooting & charging
+  if(shoot){
+    Player.chargeTime += dt*60;
+    if(Player.chargeTime>120) { // level 3
+      // large blast
+      if(Player.shootingCooldown<=0){
+        Player.shoot(0,0,Player.weapon,3); Player.shootingCooldown=20; AudioSys.sfx('charge'); Camera.shake=6; Player.chargeTime=0;
+      }
+    } else if(Player.chargeTime>50){
+      if(Player.shootingCooldown<=0){ Player.shoot(0,0,Player.weapon,2); Player.shootingCooldown=12; AudioSys.sfx('charge'); Player.chargeTime=0; }
+    } else {
+      if(Player.shootingCooldown<=0){ Player.shoot(0,0,Player.weapon,1); Player.shootingCooldown=8; }
+    }
+  } else { Player.chargeTime = 0; }
+  if(Player.shootingCooldown>0) Player.shootingCooldown -= dt*60;
+  // dash
+  if(dash && Player.dashCD<=0){
+    Player.dashTimer = 18; Player.dashCD = 80; AudioSys.sfx('dash'); Camera.shake=3;
+  }
+  if(Player.dashTimer>0){ Player.dashTimer -= dt*60; Player.vx = (Player.dir>0?6:-6); // invulnerable while dashing
+    for(let i=0;i<2;i++) spawnParticle(Player.x+Player.w/2,Player.y+Player.h/2,{c:'#8ef',vx:rand(-1,1),vy:rand(-1,1)});
+  }
+  if(Player.dashCD>0) Player.dashCD -= dt*60;
+  if(Player.invuln>0) Player.invuln -= dt*60;
+  // collisions with hazards, enemies are handled elsewhere
+  // checkpoints
+  for(const c of checkpoints) if(!c.active && Player.x>c.x && Player.x<c.x+60){
+    c.active=true; Player.respawnPoint={x:c.x,y:c.y}; Player.hp = Math.min(Player.maxHp, Player.hp + 20); SaveSys.save(); AudioSys.sfx('pickup');
+  }
+}
+
+// ----------------------------- Camera Shake Trigger -----------------------------
+function camShake(v){
+  Camera.shake = Math.max(Camera.shake, v);
+}
+
+// ----------------------------- Main Game Object -----------------------------
+const Game = {
+  mode:'menu', over:false, paused:false, stage:0, inBoss:false,
+  init(){
+    Player.maxHp = SaveSys.data.maxHP||100; Player.hp = Player.maxHp; Player.lives = SaveSys.data.lives||3;
+  },
+  startStage(st){
+    STAGE_SELECT.idx=st;
+    level = buildLevel(st);
+    Player.reset(level.start.x, level.start.y);
+    Player.lives = SaveSys.data.lives || 3;
+    this.mode='play'; this.over=false; this.paused=false; this.inBoss=false;
+    AudioSys.startMusic();
+  },
+  respawn(){
+    Player.reset(Player.respawnPoint.x, Player.respawnPoint.y);
+    this.mode='play'; this.over=false; this.paused=false;
+  },
+  update(dt){
+    if(this.mode==='play' && !this.paused && !Player.dead){
+      updatePlayer(dt); updateEnemies(dt); updateProjectiles(dt); updateHazards(dt); updateParticles(dt);
+      // boss
+      if(level && level.boss && level.boss.alive){
+        level.boss.ai(level.boss,dt);
+        // boss collision with player for melee
+        if(rectOverlap(level.boss,Player) && Player.invuln<=0){ Player.damage(18, level.boss.x < Player.x ? 4 : -4); }
+      } else if(level && level.boss && !level.boss.alive){
+        // stage clear
+        this.mode='stageclear';
+        SaveSys.data.stagesDone = Array.from(new Set(SaveSys.data.stagesDone.concat([level.stageId]))); SaveSys.save();
+        AudioSys.sfx('explode'); Camera.shake=10;
+      }
+    }
+  }
+};
+
+// ----------------------------- UI & Menus -----------------------------
+const UI = {
+  draw(){
+    // clear
+    ctx.fillStyle = STAGES[level?level.stageId:0].bg[0] || '#001'; ctx.fillRect(0,0,CANVAS_W,CANVAS_H);
+    // parallax background
+    if(level){
+      drawParallax(level);
+    } else {
+      // title background
+      drawTitleBG();
+    }
+    // draw platforms
+    if(level){
+      const sx = Math.floor(Camera.x), sy = Math.floor(Camera.y);
+      ctx.save(); ctx.translate(-sx,-sy);
+      // foreground platforms
+      for(const p of platforms){ ctx.fillStyle = p.ice? '#88c':'#444'; ctx.fillRect(p.x,p.y,p.w,p.h); ctx.strokeStyle='#111'; ctx.strokeRect(p.x,p.y,p.w,p.h); }
+      // hazards
+      for(const h of hazards){
+        ctx.fillStyle = h.type==='lava'?'#ff4a00':h.type==='acid'?'#4ff':'#f55';
+        ctx.fillRect(h.x,h.y,h.w,h.h);
+      }
+      // checkpoints
+      for(const c of checkpoints){ ctx.fillStyle=c.active?'#8f8':'#444'; ctx.fillRect(c.x,c.y-6,36,6); ctx.fillStyle='#222'; ctx.fillRect(c.x+10,c.y-2,16,4); }
+      // enemies
+      for(const e of enemies){ drawEnemy(e); }
+      // boss
+      if(level.boss && level.boss.alive) drawBoss(level.boss);
+      // projectiles
+      for(const p of projectiles){ ctx.fillStyle=p.col || '#fff'; ctx.fillRect(p.x,p.y,p.w,p.h); }
+      // player (flash when invuln)
+      drawPlayer();
+      // particles
+      drawParticles(sx,sy);
+      ctx.restore();
+    }
+    // HUD
+    drawHUD();
+    // menus
+    if(Game.mode==='menu') drawMenu();
+    if(Game.mode==='stageSelect') drawStageSelect();
+    if(Game.paused) drawPause();
+    if(Game.mode==='stageclear') drawStageClear();
+    if(Game.over) drawGameOver();
+  }
+};
+
+function drawTitleBG(){
+  // animated neon city blocks
+  ctx.fillStyle='#001020'; ctx.fillRect(0,0,CANVAS_W,CANVAS_H);
+  for(let i=0;i<60;i++){
+    ctx.fillStyle = `rgba(${80+i%80},${30+i%60},${200-i%40},${0.05+Math.sin(now/1000+i)*0.02})`;
+    ctx.fillRect((i*37)%CANVAS_W,20+Math.sin(i+now/900)*20,30,Math.random()*60+10);
+  }
+  // title text
+  ctx.save();
+  ctx.font='28px monospace'; ctx.fillStyle='#9be'; ctx.fillText('ROBO RUSH', 110, 80);
+  ctx.font='10px monospace'; ctx.fillStyle='#9be';
+  ctx.fillText('Start Game (Enter)  Stage Select (S)  Upgrades (U)  Controls (C)', 40, 110);
+  ctx.restore();
+}
+
+function drawParallax(level){
+  // three layers
+  const sx = Camera.x;
+  const layers = [
+    {col:'#041028', speed:0.12, rects:20},
+    {col:level.bg[1]||'#07334d', speed:0.25, rects:12},
+    {col:level.bg[2]||'#12334d', speed:0.5, rects:8}
+  ];
+  for(let li=0;li<layers.length;li++){
+    const L=layers[li];
+    for(let i=0;i<L.rects;i++){
+      const x = ((i*137) - sx*L.speed)%(CANVAS_W+200) - 100;
+      ctx.fillStyle = L.col; ctx.globalAlpha = 0.4 - li*0.08;
+      ctx.fillRect(x, 20+li*30, 120, 40+Math.sin((i+now/700))*20);
+      ctx.globalAlpha=1;
+    }
+  }
+}
+
+function drawPlayer(){
+  const px = Math.round(Player.x - Camera.x), py = Math.round(Player.y - Camera.y);
+  ctx.save();
+  // flash when invuln
+  if(Player.invuln%10<5) ctx.globalAlpha=0.5;
+  // body
+  ctx.fillStyle='#1d6de6'; ctx.fillRect(px,py,Player.w,Player.h);
+  // visor
+  ctx.fillStyle='#9ef'; ctx.fillRect(px+3,py+3,8,6);
+  // arm cannon
+  ctx.fillStyle='#145'; ctx.fillRect(px + (Player.dir>0?Player.w-2:-6), py+6, 6, 6);
+  // charge ring
+  if(Player.chargeTime>0){
+    const t = Math.min(1,Player.chargeTime/120);
+    ctx.strokeStyle=`rgba(255,255,100,${t})`; ctx.lineWidth=2; ctx.beginPath();
+    ctx.arc(px+7,py+10,8+6*t,0,Math.PI*2); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawEnemy(e){
+  const ex=Math.round(e.x-Camera.x), ey=Math.round(e.y-Camera.y);
+  ctx.fillStyle = '#a55'; if(e.ai==='fly') ctx.fillStyle='#5fd'; if(e.ai==='turret') ctx.fillStyle='#ca5';
+  ctx.fillRect(ex,ey,e.w,e.h);
+}
+function drawBoss(b){
+  const bx=Math.round(b.x-Camera.x), by=Math.round(b.y-Camera.y);
+  ctx.fillStyle='#882255'; ctx.fillRect(bx,by,b.w,b.h);
+  // boss health bar at top
+  ctx.fillStyle='#222'; ctx.fillRect(20,10,340,12);
+  const pct = Math.max(0,b.health)/b.maxHealth;
+  ctx.fillStyle='#f55'; ctx.fillRect(22,12, (336*pct),8);
+  ctx.strokeStyle='#000'; ctx.strokeRect(20,10,340,12);
+}
+
+function drawHUD(){
+  // top-left: HP & lives & gear
+  ctx.fillStyle='#0008'; ctx.fillRect(8,8,150,48);
+  ctx.fillStyle='#9be'; ctx.font='10px monospace'; ctx.fillText(`Stage: ${level?level.name:'MENU'}`,14,18);
+  ctx.fillStyle='#f55'; ctx.fillRect(14,26, (Player.hp/Player.maxHp)*120,8);
+  ctx.strokeStyle='#000'; ctx.strokeRect(14,26,120,8);
+  ctx.fillStyle='#9be'; ctx.fillText(`HP: ${Math.max(0,Math.floor(Player.hp))}/${Player.maxHp}`,14,46);
+  ctx.fillText(`Lives: ${Player.lives}  Gear: ${SaveSys.data.gear||0}`,200,18);
+  ctx.fillText(`Weapon: ${weaponName(Player.weapon)}  Score: ${Player.score}`,14,62);
+}
+
+function weaponName(n){
+  switch(n){ case 1:return 'Normal'; case 2:return 'Volt Blade'; case 3:return 'Thorn'; case 4:return 'Ice'; case 5:return 'Fire'; default:return '---'; }
+}
+
+function drawMenu(){
+  ctx.fillStyle='rgba(0,0,0,0.5)'; ctx.fillRect(60,40,260,140);
+  ctx.fillStyle='#9be'; ctx.font='14px monospace'; ctx.fillText('ROBO RUSH',150,70);
+  ctx.font='12px monospace'; ctx.fillText('Enter: Start Game',110,100); ctx.fillText('S: Stage Select',110,120); ctx.fillText('U: Upgrades',110,140);
+  // simple key handling
+  if(Key.enter){ Game.startStage(0); Key.enter=false; }
+  if(held['s']||held['S']){ Game.mode='stageSelect'; Key.enter=false; }
+  if(held['u']||held['U']){ Game.mode='upgrades'; Key.enter=false; }
+  if(held['c']||held['C']){ Game.mode='controls'; Key.enter=false; }
+}
+
+const STAGE_SELECT = {idx:0};
+function drawStageSelect(){
+  ctx.fillStyle='rgba(0,0,0,0.7)'; ctx.fillRect(24,24,336,168);
+  ctx.fillStyle='#9be'; ctx.fillText('Stage Select',150,48);
+  for(let i=0;i<STAGES.length;i++){
+    const s=STAGES[i];
+    const x=40+ (i%3)*120, y=70+Math.floor(i/3)*64;
+    ctx.fillStyle= SaveSys.data.stagesDone && SaveSys.data.stagesDone.includes(i) ? '#3f3' : '#666';
+    ctx.fillRect(x,y,96,40);
+    ctx.fillStyle='#000'; ctx.fillText(s.name, x+8, y+22);
+    if(Key.one && i===0) Game.startStage(i);
+    if(Key.two && i===1) Game.startStage(i);
+    // keyboard numbers direct swap:
+    if((i+1).toString()=== (held['1']?'1':(held['2']?'2':(held['3']?'3':(held['4']?'4':(held['5']?'5':'')))))){
+      Game.startStage(i);
+    }
+    // or Enter while selected
+    if(i===STAGE_SELECT.idx && Key.enter){ Game.startStage(i); Key.enter=false; }
+  }
+  if(Key.pause){ Game.mode='menu'; Key.pause=false;}
+}
+
+// pause
+function drawPause(){
+  ctx.fillStyle='rgba(0,0,0,0.6)'; ctx.fillRect(100,70,184,76);
+  ctx.fillStyle='#fff'; ctx.fillText('PAUSED',170,98); ctx.fillText('R: Restart  Esc: Resume',120,120);
+  if(Key.restart){ Game.respawn(); Key.restart=false; }
+  if(Key.pause || Key.enter){ Game.paused=false; Key.pause=false; }
+}
+
+function drawStageClear(){
+  ctx.fillStyle='rgba(0,0,0,0.7)'; ctx.fillRect(24,24,336,168);
+  ctx.fillStyle='#9be'; ctx.fillText('STAGE CLEAR!',140,80);
+  ctx.fillStyle='#fff'; ctx.fillText(`Score: ${Player.score}`,140,110);
+  if(Key.enter){ Game.mode='menu'; Key.enter=false; }
+}
+
+function drawGameOver(){
+  ctx.fillStyle='rgba(0,0,0,0.8)'; ctx.fillRect(0,0,CANVAS_W,CANVAS_H);
+  ctx.fillStyle='#f55'; ctx.fillText('BOLT DESTROYED',120,100);
+  ctx.fillStyle='#fff'; ctx.fillText('R: Retry Stage    Enter: Main Menu',80,140);
+  if(Key.restart){ Game.startStage(level.stageId); Key.restart=false; }
+  if(Key.enter){ Game.mode='menu'; Key.enter=false; }
+}
+
+// ----------------------------- Main Loop -----------------------------
+function loop(t){
+  now=t; const dt = Math.min(1/30, (t-lastTime)/1000); lastTime=t;
+  if(Game.mode==='play' && !Game.paused && !Player.dead) Game.update(dt);
+  // camera follow
+  if(level) Camera.follow(Player,dt,level);
+  // draw
+  ctx.setTransform(1,0,0,1,0,0); ctx.clearRect(0,0,CANVAS_W,CANVAS_H);
+  ctx.save();
+  Camera.apply();
+  UI.draw();
+  ctx.restore();
+  requestAnimationFrame(loop);
+}
+Game.init(); Game.mode='menu';
+requestAnimationFrame(loop);
+
+// ----------------------------- Simple Controls & Key Bindings -----------------------------
+window.addEventListener('keypress',e=>{
+  if(e.key==='r'||e.key==='R') Key.restart=true;
+  if(e.key==='1') Player.weapon=1; if(e.key==='2') Player.weapon=2;
+  if(e.key==='3') Player.weapon=3; if(e.key==='4') Player.weapon=4; if(e.key==='5') Player.weapon=5;
+});
+window.addEventListener('keydown',e=>{
+  if(e.key==='Escape'){ Game.paused = !Game.paused; Key.pause=true; }
+  if(e.key==='m') AudioSys.toggleMute();
+  if(e.key==='F5'){ SaveSys.reset(); }
+});
+
+// ----------------------------- Startup Info -----------------------------
+console.log('Robo Rush loaded. Controls: A/Left D/Right W/Up/Space Jump, J/Z Shoot, K/X Dash, 1-5 Switch Weapons, Esc Pause, R Restart');
+
+// ----------------------------- Minimal Testing Hook (developer requested) -----------------------------
+</script>
+</body>
+</html>
